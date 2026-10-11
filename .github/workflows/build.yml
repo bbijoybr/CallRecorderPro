@@ -1,7 +1,12 @@
 
-name: Build CallRecorder APK
+name: Build CallRecorderPro APK
 
-on: [push, workflow_dispatch]
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - master
 
 permissions:
   contents: read
@@ -14,31 +19,22 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set up Java
-        uses: actions/setup-java@v5
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
-
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v4
-        with:
-          packages: ''
-
-      - name: Install SDK packages
-        run: |
-          sdkmanager --licenses
-          sdkmanager "platforms;android-35" "build-tools;35.0.0"
 
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.9'
 
-      - name: Generate Android project
+      - name: Create Android project
         shell: bash
         run: |
           mkdir -p app/src/main/java/com/example/callrecorder
+          mkdir -p app/src/main/res/values
 
           cat > settings.gradle.kts <<'EOF'
           pluginManagement {
@@ -55,7 +51,7 @@ jobs:
                   mavenCentral()
               }
           }
-          rootProject.name = "CallRecorder"
+          rootProject.name = "CallRecorderPro"
           include(":app")
           EOF
 
@@ -78,39 +74,69 @@ jobs:
 
               defaultConfig {
                   applicationId = "com.example.callrecorder"
-                  minSdk = 30
+                  minSdk = 29
                   targetSdk = 35
-                  versionCode = 1
-                  versionName = "1.0"
+                  versionCode = 2
+                  versionName = "2.0"
+              }
+
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+
+              kotlinOptions {
+                  jvmTarget = "17"
               }
           }
+
+          dependencies {
+              implementation("androidx.core:core-ktx:1.13.1")
+              implementation("androidx.activity:activity-ktx:1.9.2")
+          }
+          EOF
+
+          cat > app/src/main/res/values/styles.xml <<'EOF'
+          <resources>
+              <style name="AppTheme" parent="@android:style/Theme.Material.Light.NoActionBar">
+                  <item name="android:fontFamily">sans</item>
+                  <item name="android:colorAccent">#1769AA</item>
+                  <item name="android:statusBarColor">#124B7A</item>
+                  <item name="android:navigationBarColor">#124B7A</item>
+                  <item name="android:windowLightStatusBar">false</item>
+                  <item name="android:windowActionModeOverlay">true</item>
+              </style>
+          </resources>
           EOF
 
           cat > app/src/main/AndroidManifest.xml <<'EOF'
           <manifest xmlns:android="http://schemas.android.com/apk/res/android">
-              <uses-permission android:name="android.permission.RECORD_AUDIO"/>
-              <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW"/>
-              <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
-              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE"/>
+
+              <uses-permission android:name="android.permission.RECORD_AUDIO" />
+              <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
               <application
-                  android:theme="@android:style/Theme.Material.Light.NoActionBar"
-                  android:label="Call Recorder"
-                  android:allowBackup="false">
+                  android:allowBackup="false"
+                  android:label="CallRecorderPro"
+                  android:theme="@style/AppTheme"
+                  android:usesCleartextTraffic="false">
 
                   <activity
                       android:name=".MainActivity"
                       android:exported="true">
                       <intent-filter>
-                          <action android:name="android.intent.action.MAIN"/>
-                          <category android:name="android.intent.category.LAUNCHER"/>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
                       </intent-filter>
                   </activity>
 
                   <service
                       android:name=".FloatingService"
                       android:exported="false"
-                      android:foregroundServiceType="microphone"/>
+                      android:foregroundServiceType="microphone" />
               </application>
           </manifest>
           EOF
@@ -120,84 +146,235 @@ jobs:
 
           import android.Manifest
           import android.app.Activity
-          import android.content.Intent
+          import android.content.*
           import android.content.pm.PackageManager
+          import android.media.MediaPlayer
           import android.net.Uri
+          import android.os.Build
           import android.os.Bundle
+          import android.provider.MediaStore
           import android.provider.Settings
           import android.view.Gravity
-          import android.widget.Button
-          import android.widget.LinearLayout
-          import android.widget.TextView
+          import android.view.ViewGroup
+          import android.widget.*
+          import androidx.activity.result.contract.ActivityResultContracts
+          import androidx.core.content.ContextCompat
 
           class MainActivity : Activity() {
+              private lateinit var status: TextView
+              private lateinit var list: LinearLayout
+              private var player: MediaPlayer? = null
+
+              private val micPermission =
+                  registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+                      if (granted) checkOverlayAndStart()
+                      else showStatus("মাইক্রোফোন অনুমতি ছাড়া রেকর্ডিং করা যাবে না।")
+                  }
+
+              private val receiver = object : BroadcastReceiver() {
+                  override fun onReceive(context: Context?, intent: Intent?) {
+                      val message = intent?.getStringExtra(FloatingService.EXTRA_MESSAGE)
+                      if (!message.isNullOrBlank()) showStatus(message)
+                      refreshRecordings()
+                  }
+              }
+
               override fun onCreate(savedInstanceState: Bundle?) {
                   super.onCreate(savedInstanceState)
 
-                  val layout = LinearLayout(this).apply {
+                  val root = LinearLayout(this).apply {
                       orientation = LinearLayout.VERTICAL
+                      setPadding(24, 24, 24, 24)
+                  }
+
+                  root.addView(TextView(this).apply {
+                      text = "CallRecorderPro"
+                      textSize = 26f
                       gravity = Gravity.CENTER
-                      setPadding(28, 28, 28, 28)
+                  })
+
+                  status = TextView(this).apply {
+                      text = "রেকর্ডিং শুরু করতে নিচের বোতাম চাপুন।"
+                      textSize = 16f
+                      setPadding(0, 18, 0, 18)
                   }
+                  root.addView(status)
 
-                  val info = TextView(this).apply {
-                      text = "Call Recorder\n\n" +
-                          "1. Allow microphone permission.\n" +
-                          "2. Allow display over other apps.\n" +
-                          "3. Return and press Start.\n" +
-                          "4. Tap the floating button to record or stop.\n\n" +
-                          "Microphone recording only. The other caller's " +
-                          "voice is not guaranteed to be captured."
-                      textSize = 17f
-                  }
+                  root.addView(Button(this).apply {
+                      text = "রেকর্ডিং শুরু করুন"
+                      setOnClickListener { requestPermissionsAndStart() }
+                  })
 
-                  val start = Button(this).apply {
-                      text = "Start Floating Recorder"
-                      setOnClickListener { enableRecorder() }
-                  }
-
-                  layout.addView(info)
-                  layout.addView(start)
-                  setContentView(layout)
-              }
-
-              private fun enableRecorder() {
-                  if (checkSelfPermission(Manifest.permission.RECORD_AUDIO)
-                      != PackageManager.PERMISSION_GRANTED) {
-                      requestPermissions(
-                          arrayOf(Manifest.permission.RECORD_AUDIO), 10
-                      )
-                      return
-                  }
-
-                  if (!Settings.canDrawOverlays(this)) {
-                      startActivity(
-                          Intent(
-                              Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
-                              Uri.parse("package:$packageName")
+                  root.addView(Button(this).apply {
+                      text = "রেকর্ডিং বন্ধ করুন"
+                      setOnClickListener {
+                          startService(
+                              Intent(this@MainActivity, FloatingService::class.java)
+                                  .setAction(FloatingService.ACTION_STOP)
                           )
+                      }
+                  })
+
+                  root.addView(Button(this).apply {
+                      text = "রেকর্ডিং তালিকা রিফ্রেশ"
+                      setOnClickListener { refreshRecordings() }
+                  })
+
+                  root.addView(TextView(this).apply {
+                      text = "সংরক্ষিত রেকর্ডিং"
+                      textSize = 20f
+                      setPadding(0, 20, 0, 8)
+                  })
+
+                  val scroll = ScrollView(this)
+                  list = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                  }
+                  scroll.addView(list)
+                  root.addView(scroll, LinearLayout.LayoutParams(
+                      ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f
+                  ))
+
+                  setContentView(root)
+
+                  val filter = IntentFilter(FloatingService.ACTION_STATUS)
+                  if (Build.VERSION.SDK_INT >= 33) {
+                      registerReceiver(receiver, filter, Context.RECEIVER_NOT_EXPORTED)
+                  } else {
+                      @Suppress("DEPRECATION")
+                      registerReceiver(receiver, filter)
+                  }
+
+                  refreshRecordings()
+              }
+
+              private fun requestPermissionsAndStart() {
+                  if (ContextCompat.checkSelfPermission(
+                          this, Manifest.permission.RECORD_AUDIO
+                      ) != PackageManager.PERMISSION_GRANTED) {
+                      micPermission.launch(Manifest.permission.RECORD_AUDIO)
+                      return
+                  }
+                  checkOverlayAndStart()
+              }
+
+              private fun checkOverlayAndStart() {
+                  if (!Settings.canDrawOverlays(this)) {
+                      showStatus("ফ্লোটিং বোতামের জন্য Display over other apps অনুমতি দিন।")
+                      val intent = Intent(
+                          Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                          Uri.parse("package:$packageName")
                       )
+                      startActivity(intent)
                       return
                   }
 
-                  startForegroundService(
-                      Intent(this, FloatingService::class.java)
-                  )
+                  try {
+                      ContextCompat.startForegroundService(
+                          this,
+                          Intent(this, FloatingService::class.java)
+                              .setAction(FloatingService.ACTION_START)
+                      )
+                      showStatus("রেকর্ডিং শুরু করার অনুরোধ পাঠানো হয়েছে।")
+                  } catch (e: Exception) {
+                      showStatus("রেকর্ডিং শুরু করা যায়নি: ${e.message ?: "অজানা সমস্যা"}")
+                  }
               }
 
-              override fun onRequestPermissionsResult(
-                  requestCode: Int,
-                  permissions: Array<out String>,
-                  grantResults: IntArray
-              ) {
-                  super.onRequestPermissionsResult(
-                      requestCode, permissions, grantResults
+              private fun showStatus(message: String) {
+                  if (::status.isInitialized) status.text = message
+              }
+
+              private fun refreshRecordings() {
+                  if (!::list.isInitialized) return
+                  list.removeAllViews()
+
+                  val collection = MediaStore.Audio.Media.EXTERNAL_CONTENT_URI
+                  val projection = arrayOf(
+                      MediaStore.Audio.Media._ID,
+                      MediaStore.Audio.Media.DISPLAY_NAME,
+                      MediaStore.Audio.Media.SIZE,
+                      MediaStore.Audio.Media.DATE_ADDED
                   )
-                  if (requestCode == 10 &&
-                      grantResults.isNotEmpty() &&
-                      grantResults[0] == PackageManager.PERMISSION_GRANTED) {
-                      enableRecorder()
+                  val selection = "${MediaStore.Audio.Media.RELATIVE_PATH} = ?"
+                  val args = arrayOf("Music/CallRecorder/")
+                  val sort = "${MediaStore.Audio.Media.DATE_ADDED} DESC"
+                  var count = 0
+
+                  try {
+                      contentResolver.query(
+                          collection, projection, selection, args, sort
+                      )?.use { cursor ->
+                          val idCol = cursor.getColumnIndexOrThrow(MediaStore.Audio.Media._ID)
+                          val nameCol = cursor.getColumnIndexOrThrow(MediaStore.Audio.Media.DISPLAY_NAME)
+                          val sizeCol = cursor.getColumnIndexOrThrow(MediaStore.Audio.Media.SIZE)
+
+                          while (cursor.moveToNext()) {
+                              count++
+                              val id = cursor.getLong(idCol)
+                              val name = cursor.getString(nameCol) ?: "Recording.wav"
+                              val size = cursor.getLong(sizeCol)
+                              val uri = ContentUris.withAppendedId(collection, id)
+
+                              val row = LinearLayout(this).apply {
+                                  orientation = LinearLayout.VERTICAL
+                                  setPadding(0, 12, 0, 12)
+                              }
+
+                              row.addView(TextView(this).apply {
+                                  text = "$name\n${size / 1024} KB"
+                                  textSize = 15f
+                              })
+
+                              row.addView(Button(this).apply {
+                                  text = "▶ প্লে করুন"
+                                  setOnClickListener { playRecording(uri) }
+                              })
+
+                              list.addView(row)
+                          }
+                      }
+
+                      if (count == 0) {
+                          list.addView(TextView(this).apply {
+                              text = "এখনো কোনো রেকর্ডিং পাওয়া যায়নি।"
+                              setPadding(0, 12, 0, 12)
+                          })
+                      }
+                  } catch (e: Exception) {
+                      showStatus("রেকর্ডিং তালিকা পড়া যায়নি: ${e.message ?: "ত্রুটি"}")
                   }
+              }
+
+              private fun playRecording(uri: Uri) {
+                  try {
+                      player?.release()
+                      player = MediaPlayer().apply {
+                          setDataSource(this@MainActivity, uri)
+                          setOnPreparedListener { it.start() }
+                          setOnCompletionListener {
+                              it.release()
+                              if (player === it) player = null
+                          }
+                          setOnErrorListener { mp, _, _ ->
+                              mp.release()
+                              if (player === mp) player = null
+                              showStatus("অডিও চালানো যায়নি। ফাইলটি পরীক্ষা করুন।")
+                              true
+                          }
+                          prepareAsync()
+                      }
+                      showStatus("রেকর্ডিং চালু হচ্ছে…")
+                  } catch (e: Exception) {
+                      showStatus("প্লে করা যায়নি: ${e.message ?: "ত্রুটি"}")
+                  }
+              }
+
+              override fun onDestroy() {
+                  try { unregisterReceiver(receiver) } catch (_: Exception) {}
+                  player?.release()
+                  player = null
+                  super.onDestroy()
               }
           }
           EOF
@@ -205,275 +382,376 @@ jobs:
           cat > app/src/main/java/com/example/callrecorder/FloatingService.kt <<'EOF'
           package com.example.callrecorder
 
-          import android.app.Notification
-          import android.app.NotificationChannel
-          import android.app.NotificationManager
-          import android.app.Service
-          import android.content.Intent
-          import android.content.pm.ServiceInfo
-          import android.graphics.Color
+          import android.app.*
+          import android.content.*
           import android.graphics.PixelFormat
           import android.media.AudioFormat
           import android.media.AudioRecord
           import android.media.MediaRecorder
-          import android.media.audiofx.AcousticEchoCanceler
-          import android.media.audiofx.NoiseSuppressor
+          import android.net.Uri
+          import android.os.Build
           import android.os.Environment
           import android.os.IBinder
+          import android.provider.MediaStore
           import android.view.Gravity
           import android.view.WindowManager
-          import android.widget.TextView
+          import android.widget.Button
+          import android.widget.Toast
+          import androidx.core.app.NotificationCompat
           import java.io.File
           import java.io.RandomAccessFile
-          import java.nio.ByteBuffer
-          import java.nio.ByteOrder
+          import java.text.SimpleDateFormat
+          import java.util.Date
+          import java.util.Locale
 
           class FloatingService : Service() {
-              private var wm: WindowManager? = null
-              private var button: TextView? = null
-              private var audio: AudioRecord? = null
-              private var worker: Thread? = null
+              companion object {
+                  const val ACTION_START = "com.example.callrecorder.START"
+                  const val ACTION_STOP = "com.example.callrecorder.STOP"
+                  const val ACTION_STATUS = "com.example.callrecorder.STATUS"
+                  const val EXTRA_MESSAGE = "message"
+                  private const val CHANNEL_ID = "call_recorder_channel"
+                  private const val NOTIFICATION_ID = 1201
+                  private const val SAMPLE_RATE = 16000
+              }
 
               @Volatile private var recording = false
-              private var file: File? = null
-              private var ns: NoiseSuppressor? = null
-              private var aec: AcousticEchoCanceler? = null
+              @Volatile private var workerError: String? = null
+              private var audioRecord: AudioRecord? = null
+              private var worker: Thread? = null
+              private var tempFile: File? = null
+              private var windowManager: WindowManager? = null
+              private var floatingButton: Button? = null
+
+              override fun onBind(intent: Intent?): IBinder? = null
 
               override fun onCreate() {
                   super.onCreate()
-
-                  val manager =
-                      getSystemService(NotificationManager::class.java)
-
-                  manager.createNotificationChannel(
-                      NotificationChannel(
-                          "recorder",
-                          "Call Recorder",
-                          NotificationManager.IMPORTANCE_LOW
-                      )
-                  )
-
-                  val notification = Notification.Builder(this, "recorder")
-                      .setContentTitle("Call Recorder")
-                      .setContentText("Floating recorder is ready")
-                      .setSmallIcon(android.R.drawable.ic_btn_speak_now)
-                      .build()
-
-                  startForeground(
-                      1,
-                      notification,
-                      ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
-                  )
-
-                  showButton()
+                  createNotificationChannel()
+                  startForeground(NOTIFICATION_ID, buildNotification())
+                  showFloatingButton()
               }
 
-              private fun showButton() {
-                  wm = getSystemService(WINDOW_SERVICE) as WindowManager
-
-                  val view = TextView(this).apply {
-                      text = "● REC"
-                      textSize = 16f
-                      setTextColor(Color.WHITE)
-                      setBackgroundColor(Color.rgb(180, 30, 30))
-                      gravity = Gravity.CENTER
-                      setPadding(24, 18, 24, 18)
-
-                      setOnClickListener {
-                          if (recording) stopRecording()
-                          else startRecording()
+              override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+                  when (intent?.action) {
+                      ACTION_STOP -> {
+                          stopRecording()
+                          stopSelf()
                       }
+                      ACTION_START -> startRecording()
                   }
+                  return START_NOT_STICKY
+              }
 
-                  val params = WindowManager.LayoutParams(
-                      WindowManager.LayoutParams.WRAP_CONTENT,
-                      WindowManager.LayoutParams.WRAP_CONTENT,
-                      WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
-                      WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
-                      PixelFormat.TRANSLUCENT
-                  ).apply {
-                      gravity = Gravity.TOP or Gravity.END
-                      x = 20
-                      y = 250
+              private fun createNotificationChannel() {
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                      val channel = NotificationChannel(
+                          CHANNEL_ID, "CallRecorderPro", NotificationManager.IMPORTANCE_LOW
+                      )
+                      getSystemService(NotificationManager::class.java)
+                          .createNotificationChannel(channel)
                   }
+              }
 
-                  button = view
-                  wm?.addView(view, params)
+              private fun buildNotification(): Notification {
+                  val stopIntent = Intent(this, FloatingService::class.java).setAction(ACTION_STOP)
+                  val pending = PendingIntent.getService(
+                      this, 2, stopIntent,
+                      PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+                  )
+                  return NotificationCompat.Builder(this, CHANNEL_ID)
+                      .setContentTitle("CallRecorderPro")
+                      .setContentText(if (recording) "রেকর্ডিং চলছে" else "রেকর্ডার প্রস্তুত")
+                      .setSmallIcon(android.R.drawable.ic_btn_speak_now)
+                      .setOngoing(recording)
+                      .addAction(android.R.drawable.ic_media_pause, "বন্ধ করুন", pending)
+                      .build()
+              }
+
+              private fun notifyStatus(message: String) {
+                  sendBroadcast(Intent(ACTION_STATUS).setPackage(packageName)
+                      .putExtra(EXTRA_MESSAGE, message))
+                  Toast.makeText(this, message, Toast.LENGTH_LONG).show()
+              }
+
+              private fun updateNotification() {
+                  val manager = getSystemService(NotificationManager::class.java)
+                  manager.notify(NOTIFICATION_ID, buildNotification())
+              }
+
+              private fun showFloatingButton() {
+                  if (!android.provider.Settings.canDrawOverlays(this)) return
+                  try {
+                      windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
+                      val button = Button(this).apply {
+                          text = if (recording) "STOP" else "REC"
+                          textSize = 13f
+                          setOnClickListener {
+                              if (recording) stopRecording() else startRecording()
+                          }
+                      }
+                      floatingButton = button
+                      val params = WindowManager.LayoutParams(
+                          WindowManager.LayoutParams.WRAP_CONTENT,
+                          WindowManager.LayoutParams.WRAP_CONTENT,
+                          if (Build.VERSION.SDK_INT >= 26)
+                              WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+                          else @Suppress("DEPRECATION")
+                              WindowManager.LayoutParams.TYPE_PHONE,
+                          WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
+                          PixelFormat.TRANSLUCENT
+                      )
+                      params.gravity = Gravity.TOP or Gravity.END
+                      params.x = 20
+                      params.y = 220
+                      windowManager?.addView(button, params)
+                  } catch (e: Exception) {
+                      notifyStatus("ফ্লোটিং বোতাম দেখানো যায়নি: ${e.message ?: "ত্রুটি"}")
+                  }
+              }
+
+              private fun updateFloatingButton() {
+                  floatingButton?.text = if (recording) "STOP" else "REC"
+                  updateNotification()
               }
 
               private fun startRecording() {
-                  if (recording) return
+                  if (recording) {
+                      notifyStatus("রেকর্ডিং ইতিমধ্যে চলছে।")
+                      return
+                  }
 
+                  if (checkSelfPermission(android.Manifest.permission.RECORD_AUDIO) !=
+                      android.content.pm.PackageManager.PERMISSION_GRANTED) {
+                      notifyStatus("মাইক্রোফোন অনুমতি দেওয়া হয়নি।")
+                      return
+                  }
+
+                  val minBuffer = AudioRecord.getMinBufferSize(
+                      SAMPLE_RATE,
+                      AudioFormat.CHANNEL_IN_MONO,
+                      AudioFormat.ENCODING_PCM_16BIT
+                  )
+                  if (minBuffer <= 0) {
+                      notifyStatus("অডিও রেকর্ডার চালু করা যায়নি।")
+                      return
+                  }
+
+                  var recorder: AudioRecord? = null
                   try {
-                      val rate = 16000
-                      val min = AudioRecord.getMinBufferSize(
-                          rate,
-                          AudioFormat.CHANNEL_IN_MONO,
-                          AudioFormat.ENCODING_PCM_16BIT
-                      )
-                      if (min <= 0) return
-
-                      val rec = AudioRecord(
+                      recorder = AudioRecord(
                           MediaRecorder.AudioSource.MIC,
-                          rate,
+                          SAMPLE_RATE,
                           AudioFormat.CHANNEL_IN_MONO,
                           AudioFormat.ENCODING_PCM_16BIT,
-                          min * 2
+                          maxOf(minBuffer, 4096)
                       )
-
-                      if (rec.state != AudioRecord.STATE_INITIALIZED) {
-                          rec.release()
+                      if (recorder.state != AudioRecord.STATE_INITIALIZED) {
+                          recorder.release()
+                          notifyStatus("মাইক্রোফোন চালু করা যায়নি।")
                           return
                       }
 
-                      audio = rec
-
-                      if (NoiseSuppressor.isAvailable()) {
-                          ns = NoiseSuppressor.create(rec.audioSessionId)
-                          ns?.enabled = true
+                      val file = File(cacheDir, "recording_temp.wav")
+                      RandomAccessFile(file, "rw").use {
+                          it.setLength(0)
+                          it.write(ByteArray(44))
                       }
 
-                      if (AcousticEchoCanceler.isAvailable()) {
-                          aec = AcousticEchoCanceler.create(rec.audioSessionId)
-                          aec?.enabled = true
+                      recorder.startRecording()
+                      if (recorder.recordingState != AudioRecord.RECORDSTATE_RECORDING) {
+                          recorder.release()
+                          notifyStatus("রেকর্ডিং শুরু হয়নি।")
+                          return
                       }
 
-                      val dir = File(
-                          getExternalFilesDir(Environment.DIRECTORY_MUSIC),
-                          "CallRecorder"
-                      )
-                      dir.mkdirs()
-
-                      file = File(
-                          dir,
-                          "Recording_${System.currentTimeMillis()}.wav"
-                      )
-
+                      audioRecord = recorder
+                      tempFile = file
+                      workerError = null
                       recording = true
-                      button?.text = "■ STOP"
-                      rec.startRecording()
+                      updateFloatingButton()
+                      notifyStatus("রেকর্ডিং চলছে। বন্ধ করলে Music/CallRecorder-এ সেভ হবে।")
 
+                      val activeRecorder = recorder
                       worker = Thread {
-                          val output = file ?: return@Thread
-
-                          output.outputStream().use { stream ->
-                              stream.write(ByteArray(44))
-                              val buffer = ByteArray(min)
-
-                              while (recording) {
-                                  val n = rec.read(
-                                      buffer, 0, buffer.size,
-                                      AudioRecord.READ_BLOCKING
-                                  )
-                                  if (n > 0) stream.write(buffer, 0, n)
+                          try {
+                              RandomAccessFile(file, "rw").use { raf ->
+                                  raf.seek(44)
+                                  val buffer = ByteArray(4096)
+                                  while (recording) {
+                                      val n = activeRecorder.read(
+                                          buffer, 0, buffer.size
+                                      )
+                                      if (n > 0) {
+                                          val evenBytes = n - (n % 2)
+                                          if (evenBytes > 0) raf.write(buffer, 0, evenBytes)
+                                      } else if (n < 0 && recording) {
+                                          workerError = "মাইক্রোফোন থেকে অডিও পড়া যায়নি (কোড $n)।"
+                                          recording = false
+                                      }
+                                  }
+                                  val pcmSize = (raf.length() - 44).coerceAtLeast(0)
+                                  writeWavHeader(raf, pcmSize)
                               }
+                          } catch (e: Exception) {
+                              if (recording) workerError =
+                                  "রেকর্ডিং লেখার সমস্যা: ${e.message ?: "অজানা ত্রুটি"}"
+                              recording = false
                           }
-                      }
-
-                      worker?.start()
-                  } catch (_: Exception) {
+                      }.apply { name = "CallRecorderAudioWorker"; start() }
+                  } catch (e: Exception) {
                       recording = false
-                      button?.text = "● REC"
-                      try { audio?.release() } catch (_: Exception) {}
-                      audio = null
+                      try { recorder?.release() } catch (_: Exception) {}
+                      audioRecord = null
+                      updateFloatingButton()
+                      notifyStatus("রেকর্ডিং শুরু করা যায়নি: ${e.message ?: "ত্রুটি"}")
                   }
               }
 
               private fun stopRecording() {
-                  if (!recording) return
-
-                  recording = false
-                  try { audio?.stop() } catch (_: Exception) {}
-                  try { worker?.join(3000) } catch (_: Exception) {}
-                  try { audio?.release() } catch (_: Exception) {}
-                  audio = null
-
-                  try { ns?.release() } catch (_: Exception) {}
-                  ns = null
-                  try { aec?.release() } catch (_: Exception) {}
-                  aec = null
-
-                  file?.let { f ->
-                      try {
-                          val size = (f.length() - 44)
-                              .toInt().coerceAtLeast(0)
-
-                          RandomAccessFile(f, "rw").use { r ->
-                              r.seek(0)
-                              r.writeBytes("RIFF")
-                              putInt(r, size + 36)
-                              r.writeBytes("WAVEfmt ")
-                              putInt(r, 16)
-                              putShort(r, 1)
-                              putShort(r, 1)
-                              putInt(r, 16000)
-                              putInt(r, 32000)
-                              putShort(r, 2)
-                              putShort(r, 16)
-                              r.writeBytes("data")
-                              putInt(r, size)
-                          }
-                      } catch (_: Exception) {}
+                  if (!recording && worker == null) {
+                      notifyStatus("কোনো রেকর্ডিং চলছে না।")
+                      return
                   }
 
-                  button?.text = "● REC"
+                  recording = false
+                  try { audioRecord?.stop() } catch (_: Exception) {}
+                  try { worker?.join(5000) } catch (_: InterruptedException) {
+                      Thread.currentThread().interrupt()
+                  }
+
+                  if (worker?.isAlive == true) {
+                      worker?.interrupt()
+                      cleanupRecorder()
+                      updateFloatingButton()
+                      notifyStatus("রেকর্ডিং বন্ধ হয়েছে, কিন্তু ফাইল সম্পূর্ণ সেভ হয়নি। আবার চেষ্টা করুন।")
+                      return
+                  }
+
+                  cleanupRecorder()
+                  updateFloatingButton()
+
+                  val error = workerError
+                  val file = tempFile
+                  worker = null
+                  tempFile = null
+
+                  if (error != null) {
+                      file?.delete()
+                      notifyStatus("সেভ ব্যর্থ: $error")
+                      return
+                  }
+
+                  if (file == null || !file.exists() || file.length() <= 44) {
+                      file?.delete()
+                      notifyStatus("কোনো অডিও পাওয়া যায়নি। ফাইল সেভ করা হয়নি।")
+                      return
+                  }
+
+                  try {
+                      saveToPublicMusic(file)
+                      file.delete()
+                      notifyStatus("রেকর্ডিং সফলভাবে Music/CallRecorder ফোল্ডারে সেভ হয়েছে।")
+                  } catch (e: Exception) {
+                      notifyStatus("সেভ ব্যর্থ: ${e.message ?: "স্টোরেজ সমস্যা"}। ফাইলটি অ্যাপে অস্থায়ীভাবে থাকতে পারে।")
+                  }
               }
 
-              private fun putInt(r: RandomAccessFile, n: Int) {
-                  r.write(
-                      ByteBuffer.allocate(4)
-                          .order(ByteOrder.LITTLE_ENDIAN)
-                          .putInt(n).array()
-                  )
+              private fun cleanupRecorder() {
+                  try { audioRecord?.release() } catch (_: Exception) {}
+                  audioRecord = null
               }
 
-              private fun putShort(r: RandomAccessFile, n: Int) {
-                  r.write(
-                      ByteBuffer.allocate(2)
-                          .order(ByteOrder.LITTLE_ENDIAN)
-                          .putShort(n.toShort()).array()
-                  )
+              private fun saveToPublicMusic(file: File) {
+                  val stamp = SimpleDateFormat(
+                      "yyyyMMdd_HHmmss", Locale.US
+                  ).format(Date())
+                  val values = android.content.ContentValues().apply {
+                      put(MediaStore.Audio.Media.DISPLAY_NAME, "Recording_$stamp.wav")
+                      put(MediaStore.Audio.Media.MIME_TYPE, "audio/wav")
+                      put(
+                          MediaStore.Audio.Media.RELATIVE_PATH,
+                          Environment.DIRECTORY_MUSIC + "/CallRecorder/"
+                      )
+                      put(MediaStore.Audio.Media.IS_PENDING, 1)
+                  }
+
+                  val uri: Uri = contentResolver.insert(
+                      MediaStore.Audio.Media.EXTERNAL_CONTENT_URI, values
+                  ) ?: throw IllegalStateException("স্টোরেজে ফাইল তৈরি করা যায়নি")
+
+                  try {
+                      contentResolver.openOutputStream(uri, "w").use { output ->
+                          if (output == null) {
+                              throw IllegalStateException("ফাইল লেখার অনুমতি পাওয়া যায়নি")
+                          }
+                          file.inputStream().use { input -> input.copyTo(output) }
+                          output.flush()
+                      }
+
+                      val expectedSize = file.length()
+                      val actualSize = contentResolver.openFileDescriptor(uri, "r").use {
+                          it?.statSize ?: -1L
+                      }
+                      if (actualSize >= 0 && actualSize != expectedSize) {
+                          throw IllegalStateException("সেভ করা ফাইলের আকার মিলছে না")
+                      }
+
+                      val completed = android.content.ContentValues().apply {
+                          put(MediaStore.Audio.Media.IS_PENDING, 0)
+                      }
+                      contentResolver.update(uri, completed, null, null)
+                  } catch (e: Exception) {
+                      try { contentResolver.delete(uri, null, null) } catch (_: Exception) {}
+                      throw e
+                  }
               }
 
-              override fun onStartCommand(
-                  intent: Intent?, flags: Int, startId: Int
-              ): Int = START_NOT_STICKY
+              private fun writeWavHeader(file: RandomAccessFile, pcmSize: Long) {
+                  val dataSize = pcmSize.coerceAtMost(0x7FFFFFFFL).toInt()
+                  val byteRate = SAMPLE_RATE * 1 * 16 / 8
+                  file.seek(0)
+                  file.writeBytes("RIFF")
+                  writeIntLE(file, 36 + dataSize)
+                  file.writeBytes("WAVE")
+                  file.writeBytes("fmt ")
+                  writeIntLE(file, 16)
+                  writeShortLE(file, 1)
+                  writeShortLE(file, 1)
+                  writeIntLE(file, SAMPLE_RATE)
+                  writeIntLE(file, byteRate)
+                  writeShortLE(file, 2)
+                  writeShortLE(file, 16)
+                  file.writeBytes("data")
+                  writeIntLE(file, dataSize)
+              }
+
+              private fun writeIntLE(file: RandomAccessFile, value: Int) {
+                  file.write(value and 0xff)
+                  file.write((value shr 8) and 0xff)
+                  file.write((value shr 16) and 0xff)
+                  file.write((value shr 24) and 0xff)
+              }
+
+              private fun writeShortLE(file: RandomAccessFile, value: Int) {
+                  file.write(value and 0xff)
+                  file.write((value shr 8) and 0xff)
+              }
 
               override fun onDestroy() {
-                  if (recording) stopRecording()
+                  if (recording || worker != null) stopRecording()
                   try {
-                      button?.let { wm?.removeView(it) }
+                      floatingButton?.let { windowManager?.removeView(it) }
                   } catch (_: Exception) {}
+                  floatingButton = null
+                  stopForeground(STOP_FOREGROUND_REMOVE)
                   super.onDestroy()
               }
-
-              override fun onBind(intent: Intent?): IBinder? = null
           }
           EOF
 
-      
       - name: Build APK
-        run: |
-          python3 - <<'PY'
-          from pathlib import Path
-          p = Path("app/build.gradle.kts")
-          s = p.read_text()
-          s = s.replace(
-              "android {\n",
-              "android {\n"
-              "    compileOptions {\n"
-              "        sourceCompatibility = JavaVersion.VERSION_17\n"
-              "        targetCompatibility = JavaVersion.VERSION_17\n"
-              "    }\n"
-              "    kotlinOptions {\n"
-              "        jvmTarget = \"17\"\n"
-              "    }\n",
-              1
-          )
-          p.write_text(s)
-          PY
-          gradle --no-daemon assembleDebug
-
+        run: gradle --no-daemon assembleDebug
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
