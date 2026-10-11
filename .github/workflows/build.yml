@@ -451,8 +451,29 @@ jobs:
           }
           EOF
 
+      
       - name: Build APK
-        run: gradle --no-daemon assembleDebug
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path("app/build.gradle.kts")
+          s = p.read_text()
+          s = s.replace(
+              "android {\n",
+              "android {\n"
+              "    compileOptions {\n"
+              "        sourceCompatibility = JavaVersion.VERSION_17\n"
+              "        targetCompatibility = JavaVersion.VERSION_17\n"
+              "    }\n"
+              "    kotlinOptions {\n"
+              "        jvmTarget = \"17\"\n"
+              "    }\n",
+              1
+          )
+          p.write_text(s)
+          PY
+          gradle --no-daemon assembleDebug
+
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
