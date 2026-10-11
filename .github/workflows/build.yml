@@ -7,6 +7,8 @@ on:
     branches:
       - main
       - master
+    paths:
+      - .github/workflows/build.yml
 
 permissions:
   contents: read
@@ -14,6 +16,7 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
 
     steps:
       - name: Checkout repository
@@ -23,17 +26,21 @@ jobs:
         uses: actions/setup-java@v5
         with:
           distribution: temurin
-          java-version: '17'
+          java-version: "17"
 
-      - name: Set up Gradle
-        uses: gradle/actions/setup-gradle@v4
-        with:
-          gradle-version: '8.9'
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
 
-      - name: Generate Android project
+      - name: Install SDK
+        run: |
+          sdkmanager "platforms;android-35" "build-tools;35.0.0"
+
+      - name: Create Android project
         shell: bash
         run: |
-          mkdir -p app/src/main/java/com/example/callrecorder
+          set -euo pipefail
+
+          mkdir -p app/src/main/java/com/callrecorderpro
           mkdir -p app/src/main/res/values
 
           cat > gradle.properties <<'EOF'
@@ -50,7 +57,6 @@ jobs:
                   gradlePluginPortal()
               }
           }
-
           dependencyResolutionManagement {
               repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
               repositories {
@@ -58,7 +64,6 @@ jobs:
                   mavenCentral()
               }
           }
-
           rootProject.name = "CallRecorderPro"
           include(":app")
           EOF
@@ -77,15 +82,15 @@ jobs:
           }
 
           android {
-              namespace = "com.example.callrecorder"
+              namespace = "com.callrecorderpro"
               compileSdk = 35
 
               defaultConfig {
-                  applicationId = "com.example.callrecorder"
+                  applicationId = "com.callrecorderpro"
                   minSdk = 29
                   targetSdk = 35
                   versionCode = 2
-                  versionName = "2.0"
+                  versionName = "1.1"
               }
 
               compileOptions {
@@ -97,21 +102,16 @@ jobs:
                   jvmTarget = "17"
               }
           }
-
-          dependencies {
-              implementation("androidx.core:core-ktx:1.13.1")
-              implementation("androidx.activity:activity-ktx:1.9.2")
-          }
           EOF
 
           cat > app/src/main/res/values/styles.xml <<'EOF'
           <resources>
-              <style name="AppTheme" parent="@android:style/Theme.Material.Light.NoActionBar">
+              <style name="AppTheme"
+                  parent="@android:style/Theme.Material.Light.NoActionBar">
                   <item name="android:fontFamily">sans</item>
-                  <item name="android:colorAccent">#1769AA</item>
-                  <item name="android:statusBarColor">#124B7A</item>
-                  <item name="android:navigationBarColor">#124B7A</item>
-                  <item name="android:windowLightStatusBar">false</item>
+                  <item name="android:colorAccent">#1565C0</item>
+                  <item name="android:statusBarColor">#0D47A1</item>
+                  <item name="android:navigationBarColor">#0D47A1</item>
               </style>
           </resources>
           EOF
@@ -120,7 +120,7 @@ jobs:
           <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
               <uses-permission android:name="android.permission.RECORD_AUDIO" />
-              <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+              <uses-permission android:name="android.permission.READ_PHONE_STATE" />
               <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
               <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
               <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
@@ -140,325 +140,259 @@ jobs:
                   </activity>
 
                   <service
-                      android:name=".FloatingService"
+                      android:name=".CallRecordingService"
                       android:exported="false"
                       android:foregroundServiceType="microphone" />
+
               </application>
           </manifest>
           EOF
 
-          cat > app/src/main/java/com/example/callrecorder/MainActivity.kt <<'EOF'
-          package com.example.callrecorder
+          cat > app/src/main/java/com/callrecorderpro/MainActivity.kt <<'EOF'
+          package com.callrecorderpro
 
           import android.Manifest
-          import android.content.BroadcastReceiver
-          import android.content.ContentUris
-          import android.content.Context
+          import android.app.Activity
           import android.content.Intent
-          import android.content.IntentFilter
           import android.content.pm.PackageManager
           import android.media.MediaPlayer
           import android.net.Uri
           import android.os.Build
           import android.os.Bundle
           import android.provider.MediaStore
-          import android.provider.Settings
           import android.view.Gravity
           import android.view.ViewGroup
           import android.widget.Button
           import android.widget.LinearLayout
           import android.widget.ScrollView
           import android.widget.TextView
-          import androidx.activity.ComponentActivity
-          import androidx.activity.result.contract.ActivityResultContracts
-          import androidx.core.content.ContextCompat
+          import android.widget.Toast
 
-          class MainActivity : ComponentActivity() {
-
+          class MainActivity : Activity() {
               private lateinit var status: TextView
-              private lateinit var recordingList: LinearLayout
+              private lateinit var recordings: LinearLayout
               private var player: MediaPlayer? = null
-
-              private val micPermission =
-                  registerForActivityResult(
-                      ActivityResultContracts.RequestPermission()
-                  ) { granted ->
-                      if (granted) {
-                          checkOverlayAndStart()
-                      } else {
-                          showStatus("Microphone permission was denied.")
-                      }
-                  }
-
-              private val statusReceiver = object : BroadcastReceiver() {
-                  override fun onReceive(context: Context?, intent: Intent?) {
-                      val message = intent?.getStringExtra(
-                          FloatingService.EXTRA_MESSAGE
-                      )
-                      if (!message.isNullOrBlank()) {
-                          showStatus(message)
-                      }
-                      refreshRecordings()
-                  }
-              }
+              private val permissionRequest = 100
 
               override fun onCreate(savedInstanceState: Bundle?) {
                   super.onCreate(savedInstanceState)
+                  createScreen()
+                  requestPermissionsIfNeeded()
+              }
 
+              private fun createScreen() {
                   val root = LinearLayout(this).apply {
                       orientation = LinearLayout.VERTICAL
-                      setPadding(22, 22, 22, 22)
+                      setPadding(20, 20, 20, 20)
                   }
 
                   root.addView(TextView(this).apply {
                       text = "CallRecorderPro"
-                      textSize = 26f
+                      textSize = 27f
                       gravity = Gravity.CENTER
                   })
 
+                  root.addView(TextView(this).apply {
+                      text = "For call recording, turn ON speakerphone after answering. " +
+                          "Android may block call audio from third-party apps, so both voices " +
+                          "cannot be guaranteed."
+                      textSize = 15f
+                      setPadding(0, 16, 0, 16)
+                  })
+
+                  root.addView(Button(this).apply {
+                      text = "Enable call monitoring"
+                      setOnClickListener {
+                          if (!hasPermissions()) {
+                              requestPermissionsIfNeeded()
+                              return@setOnClickListener
+                          }
+                          try {
+                              val intent = Intent(
+                                  this@MainActivity,
+                                  CallRecordingService::class.java
+                              ).setAction(CallRecordingService.START_MONITORING)
+
+                              if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                                  startForegroundService(intent)
+                              } else {
+                                  startService(intent)
+                              }
+                              status.text = "Monitoring enabled. Turn speakerphone ON during calls."
+                          } catch (e: Exception) {
+                              status.text = "Could not start: ${e.message}"
+                          }
+                      }
+                  })
+
+                  root.addView(Button(this).apply {
+                      text = "Stop monitoring"
+                      setOnClickListener {
+                          stopService(
+                              Intent(this@MainActivity, CallRecordingService::class.java)
+                          )
+                          status.text = "Monitoring stopped."
+                      }
+                  })
+
+                  root.addView(Button(this).apply {
+                      text = "Refresh recordings"
+                      setOnClickListener { loadRecordings() }
+                  })
+
                   status = TextView(this).apply {
-                      text = "Ready to record"
-                      textSize = 16f
-                      setPadding(0, 18, 0, 18)
+                      text = "Grant permissions, then enable monitoring."
+                      textSize = 14f
+                      setPadding(0, 12, 0, 12)
                   }
                   root.addView(status)
 
-                  root.addView(Button(this).apply {
-                      text = "Start Recording"
-                      setOnClickListener {
-                          requestPermissionsAndStart()
-                      }
-                  })
-
-                  root.addView(Button(this).apply {
-                      text = "Stop Recording"
-                      setOnClickListener {
-                          startService(
-                              Intent(
-                                  this@MainActivity,
-                                  FloatingService::class.java
-                              ).setAction(FloatingService.ACTION_STOP)
-                          )
-                      }
-                  })
-
-                  root.addView(Button(this).apply {
-                      text = "Refresh Recordings"
-                      setOnClickListener { refreshRecordings() }
-                  })
-
                   root.addView(TextView(this).apply {
-                      text = "Saved Recordings"
-                      textSize = 20f
-                      setPadding(0, 20, 0, 10)
+                      text = "Recordings — Music/CallRecorder"
+                      textSize = 19f
                   })
 
-                  val scroll = ScrollView(this)
-                  recordingList = LinearLayout(this).apply {
+                  recordings = LinearLayout(this).apply {
                       orientation = LinearLayout.VERTICAL
                   }
-                  scroll.addView(recordingList)
 
-                  root.addView(
-                      scroll,
-                      LinearLayout.LayoutParams(
-                          ViewGroup.LayoutParams.MATCH_PARENT,
-                          0,
-                          1f
-                      )
-                  )
+                  val scroll = ScrollView(this)
+                  scroll.addView(recordings)
+                  root.addView(scroll, LinearLayout.LayoutParams(
+                      ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f
+                  ))
 
                   setContentView(root)
+                  loadRecordings()
+              }
 
-                  val filter = IntentFilter(FloatingService.ACTION_STATUS)
+              private fun hasPermissions(): Boolean {
+                  val required = mutableListOf(
+                      Manifest.permission.RECORD_AUDIO,
+                      Manifest.permission.READ_PHONE_STATE
+                  )
                   if (Build.VERSION.SDK_INT >= 33) {
-                      registerReceiver(
-                          statusReceiver,
-                          filter,
-                          Context.RECEIVER_NOT_EXPORTED
-                      )
-                  } else {
-                      @Suppress("DEPRECATION")
-                      registerReceiver(statusReceiver, filter)
+                      required.add(Manifest.permission.POST_NOTIFICATIONS)
                   }
-
-                  refreshRecordings()
-              }
-
-              private fun requestPermissionsAndStart() {
-                  if (
-                      ContextCompat.checkSelfPermission(
-                          this,
-                          Manifest.permission.RECORD_AUDIO
-                      ) != PackageManager.PERMISSION_GRANTED
-                  ) {
-                      micPermission.launch(Manifest.permission.RECORD_AUDIO)
-                      return
-                  }
-
-                  checkOverlayAndStart()
-              }
-
-              private fun checkOverlayAndStart() {
-                  if (!Settings.canDrawOverlays(this)) {
-                      showStatus(
-                          "Allow Display over other apps, then return and tap Start."
-                      )
-                      startActivity(
-                          Intent(
-                              Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
-                              Uri.parse("package:$packageName")
-                          )
-                      )
-                      return
-                  }
-
-                  try {
-                      ContextCompat.startForegroundService(
-                          this,
-                          Intent(this, FloatingService::class.java)
-                              .setAction(FloatingService.ACTION_START)
-                      )
-                      showStatus("Starting recorder...")
-                  } catch (e: Exception) {
-                      showStatus(
-                          "Could not start: ${e.message ?: "Unknown error"}"
-                      )
+                  return required.all {
+                      checkSelfPermission(it) == PackageManager.PERMISSION_GRANTED
                   }
               }
 
-              private fun showStatus(message: String) {
-                  if (::status.isInitialized) {
-                      status.text = message
+              private fun requestPermissionsIfNeeded() {
+                  val required = mutableListOf(
+                      Manifest.permission.RECORD_AUDIO,
+                      Manifest.permission.READ_PHONE_STATE
+                  )
+                  if (Build.VERSION.SDK_INT >= 33) {
+                      required.add(Manifest.permission.POST_NOTIFICATIONS)
+                  }
+                  val missing = required.filter {
+                      checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED
+                  }
+                  if (missing.isNotEmpty()) {
+                      requestPermissions(missing.toTypedArray(), permissionRequest)
                   }
               }
 
-              private fun refreshRecordings() {
-                  if (!::recordingList.isInitialized) return
+              override fun onRequestPermissionsResult(
+                  requestCode: Int,
+                  permissions: Array<out String>,
+                  grantResults: IntArray
+              ) {
+                  super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+                  if (requestCode == permissionRequest) {
+                      status.text = if (hasPermissions()) {
+                          "Permissions granted. Enable call monitoring."
+                      } else {
+                          "Required permissions were not granted."
+                      }
+                  }
+              }
 
-                  recordingList.removeAllViews()
-                  var count = 0
+              private fun loadRecordings() {
+                  if (!::recordings.isInitialized) return
+                  recordings.removeAllViews()
 
-                  val collection =
-                      MediaStore.Audio.Media.EXTERNAL_CONTENT_URI
-
+                  val collection = MediaStore.Audio.Media.EXTERNAL_CONTENT_URI
                   val projection = arrayOf(
                       MediaStore.Audio.Media._ID,
-                      MediaStore.Audio.Media.DISPLAY_NAME,
-                      MediaStore.Audio.Media.SIZE
+                      MediaStore.Audio.Media.DISPLAY_NAME
                   )
-
-                  val selection =
-                      "${MediaStore.Audio.Media.RELATIVE_PATH} = ?"
-                  val selectionArgs = arrayOf("Music/CallRecorder/")
-                  val sortOrder =
-                      "${MediaStore.Audio.Media.DATE_ADDED} DESC"
 
                   try {
                       contentResolver.query(
                           collection,
                           projection,
-                          selection,
-                          selectionArgs,
-                          sortOrder
+                          "${MediaStore.Audio.Media.RELATIVE_PATH} = ?",
+                          arrayOf("Music/CallRecorder/"),
+                          "${MediaStore.Audio.Media.DATE_ADDED} DESC"
                       )?.use { cursor ->
-
-                          val idIndex = cursor.getColumnIndexOrThrow(
-                              MediaStore.Audio.Media._ID
-                          )
-                          val nameIndex = cursor.getColumnIndexOrThrow(
-                              MediaStore.Audio.Media.DISPLAY_NAME
-                          )
-                          val sizeIndex = cursor.getColumnIndexOrThrow(
-                              MediaStore.Audio.Media.SIZE
-                          )
+                          if (cursor.count == 0) {
+                              recordings.addView(TextView(this).apply {
+                                  text = "No recordings found yet."
+                                  setPadding(0, 12, 0, 12)
+                              })
+                          }
 
                           while (cursor.moveToNext()) {
-                              count++
-
-                              val id = cursor.getLong(idIndex)
-                              val name = cursor.getString(nameIndex)
-                                  ?: "Recording.wav"
-                              val size = cursor.getLong(sizeIndex)
-
-                              val uri = ContentUris.withAppendedId(
-                                  collection,
-                                  id
+                              val id = cursor.getLong(
+                                  cursor.getColumnIndexOrThrow(MediaStore.Audio.Media._ID)
                               )
+                              val name = cursor.getString(
+                                  cursor.getColumnIndexOrThrow(
+                                      MediaStore.Audio.Media.DISPLAY_NAME
+                                  )
+                              ) ?: "Recording"
 
-                              val row = LinearLayout(this).apply {
-                                  orientation = LinearLayout.VERTICAL
-                                  setPadding(0, 10, 0, 10)
-                              }
+                              val uri = Uri.withAppendedPath(collection, id.toString())
 
-                              row.addView(TextView(this).apply {
-                                  text = "$name\n${size / 1024} KB"
+                              recordings.addView(TextView(this).apply {
+                                  text = name
                                   textSize = 15f
+                                  setPadding(0, 12, 0, 4)
                               })
 
-                              row.addView(Button(this).apply {
+                              recordings.addView(Button(this).apply {
                                   text = "Play"
-                                  setOnClickListener {
-                                      playRecording(uri)
-                                  }
+                                  setOnClickListener { play(uri) }
                               })
-
-                              recordingList.addView(row)
                           }
                       }
-
-                      if (count == 0) {
-                          recordingList.addView(TextView(this).apply {
-                              text = "No recordings found yet."
-                              setPadding(0, 12, 0, 12)
-                          })
-                      }
                   } catch (e: Exception) {
-                      showStatus(
-                          "Could not load recordings: ${e.message ?: "Error"}"
-                      )
+                      recordings.addView(TextView(this).apply {
+                          text = "Could not load recordings: ${e.message}"
+                      })
                   }
               }
 
-              private fun playRecording(uri: Uri) {
+              private fun play(uri: Uri) {
                   try {
                       player?.release()
                       player = MediaPlayer().apply {
                           setDataSource(this@MainActivity, uri)
-
-                          setOnPreparedListener { mp ->
-                              mp.start()
-                              showStatus("Playing recording...")
+                          setOnCompletionListener {
+                              it.release()
+                              if (player === it) player = null
                           }
-
-                          setOnCompletionListener { mp ->
-                              mp.release()
-                              if (player === mp) player = null
-                              showStatus("Playback finished.")
-                          }
-
-                          setOnErrorListener { mp, _, _ ->
-                              mp.release()
-                              if (player === mp) player = null
-                              showStatus("Could not play this audio file.")
-                              true
-                          }
-
-                          prepareAsync()
+                          prepare()
+                          start()
                       }
                   } catch (e: Exception) {
-                      showStatus(
-                          "Playback failed: ${e.message ?: "Unknown error"}"
-                      )
+                      player?.release()
+                      player = null
+                      Toast.makeText(
+                          this, "Playback failed: ${e.message}", Toast.LENGTH_LONG
+                      ).show()
                   }
               }
 
-              override fun onDestroy() {
-                  try {
-                      unregisterReceiver(statusReceiver)
-                  } catch (_: Exception) {
-                  }
+              override fun onResume() {
+                  super.onResume()
+                  if (::recordings.isInitialized) loadRecordings()
+              }
 
+              override fun onDestroy() {
                   player?.release()
                   player = null
                   super.onDestroy()
@@ -466,95 +400,260 @@ jobs:
           }
           EOF
 
-          cat > app/src/main/java/com/example/callrecorder/FloatingService.kt <<'EOF'
-          package com.example.callrecorder
+          cat > app/src/main/java/com/callrecorderpro/CallRecordingService.kt <<'EOF'
+          package com.callrecorderpro
 
           import android.app.Notification
           import android.app.NotificationChannel
           import android.app.NotificationManager
-          import android.app.PendingIntent
           import android.app.Service
           import android.content.ContentValues
           import android.content.Intent
-          import android.content.pm.PackageManager
-          import android.graphics.PixelFormat
           import android.media.AudioFormat
           import android.media.AudioRecord
           import android.media.MediaRecorder
-          import android.net.Uri
           import android.os.Build
-          import android.os.Environment
           import android.os.IBinder
           import android.provider.MediaStore
-          import android.provider.Settings
-          import android.view.Gravity
-          import android.view.WindowManager
-          import android.widget.Button
-          import android.widget.Toast
-          import androidx.core.app.NotificationCompat
+          import android.telephony.PhoneStateListener
+          import android.telephony.TelephonyManager
           import java.io.File
-          import java.io.RandomAccessFile
+          import java.io.FileInputStream
+          import java.io.FileOutputStream
           import java.text.SimpleDateFormat
           import java.util.Date
           import java.util.Locale
+          import kotlin.concurrent.thread
 
-          class FloatingService : Service() {
-
+          class CallRecordingService : Service() {
               companion object {
-                  const val ACTION_START =
-                      "com.example.callrecorder.START"
-                  const val ACTION_STOP =
-                      "com.example.callrecorder.STOP"
-                  const val ACTION_STATUS =
-                      "com.example.callrecorder.STATUS"
-                  const val EXTRA_MESSAGE = "message"
-
-                  private const val CHANNEL_ID = "call_recorder_channel"
-                  private const val NOTIFICATION_ID = 1201
-                  private const val SAMPLE_RATE = 16000
+                  const val START_MONITORING = "com.callrecorderpro.START_MONITORING"
+                  private const val CHANNEL = "call_recorder_channel"
+                  private const val NOTIFICATION_ID = 2101
+                  private const val RATE = 16000
               }
 
-              @Volatile
-              private var recording = false
-
-              @Volatile
-              private var workerError: String? = null
-
-              private var audioRecord: AudioRecord? = null
+              private var telephony: TelephonyManager? = null
+              private var listener: PhoneStateListener? = null
+              private var recorder: AudioRecord? = null
+              @Volatile private var recording = false
+              @Volatile private var monitoring = false
               private var worker: Thread? = null
               private var tempFile: File? = null
-              private var windowManager: WindowManager? = null
-              private var floatingButton: Button? = null
-
-              override fun onBind(intent: Intent?): IBinder? = null
 
               override fun onCreate() {
                   super.onCreate()
-                  createNotificationChannel()
-                  startForeground(NOTIFICATION_ID, buildNotification())
-                  showFloatingButton()
+                  createChannel()
               }
 
-              override fun onStartCommand(
-                  intent: Intent?,
-                  flags: Int,
-                  startId: Int
-              ): Int {
-                  when (intent?.action) {
-                      ACTION_START -> startRecording()
-                      ACTION_STOP -> {
-                          stopRecording()
-                          stopSelf()
-                      }
-                  }
+              override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+                  startForeground(
+                      NOTIFICATION_ID,
+                      notification("Waiting for a phone call")
+                  )
+                  startMonitoring()
                   return START_NOT_STICKY
               }
 
-              private fun createNotificationChannel() {
+              @Suppress("DEPRECATION")
+              private fun startMonitoring() {
+                  if (monitoring) return
+
+                  try {
+                      telephony = getSystemService(TELEPHONY_SERVICE) as TelephonyManager
+                      listener = object : PhoneStateListener() {
+                          override fun onCallStateChanged(state: Int, phoneNumber: String?) {
+                              when (state) {
+                                  TelephonyManager.CALL_STATE_RINGING -> {
+                                      updateNotification(
+                                          "Incoming call. Answer and turn speakerphone ON."
+                                      )
+                                  }
+                                  TelephonyManager.CALL_STATE_OFFHOOK -> {
+                                      updateNotification(
+                                          "Call active. Turn speakerphone ON for best results."
+                                      )
+                                      startRecording()
+                                  }
+                                  TelephonyManager.CALL_STATE_IDLE -> {
+                                      stopRecording()
+                                      updateNotification("Call ended. Waiting for another call.")
+                                  }
+                              }
+                          }
+                      }
+                      telephony?.listen(listener, PhoneStateListener.LISTEN_CALL_STATE)
+                      monitoring = true
+                  } catch (e: Exception) {
+                      updateNotification("Monitoring failed: ${e.message}")
+                  }
+              }
+
+              private fun startRecording() {
+                  if (recording) return
+
+                  try {
+                      val minimum = AudioRecord.getMinBufferSize(
+                          RATE,
+                          AudioFormat.CHANNEL_IN_MONO,
+                          AudioFormat.ENCODING_PCM_16BIT
+                      )
+                      if (minimum <= 0) {
+                          updateNotification("Microphone is unavailable")
+                          return
+                      }
+
+                      val audio = AudioRecord(
+                          MediaRecorder.AudioSource.MIC,
+                          RATE,
+                          AudioFormat.CHANNEL_IN_MONO,
+                          AudioFormat.ENCODING_PCM_16BIT,
+                          maxOf(minimum * 2, 8192)
+                      )
+
+                      if (audio.state != AudioRecord.STATE_INITIALIZED) {
+                          audio.release()
+                          updateNotification("Could not initialize microphone")
+                          return
+                      }
+
+                      val stamp = SimpleDateFormat(
+                          "yyyyMMdd_HHmmss", Locale.US
+                      ).format(Date())
+
+                      val file = File(cacheDir, "CallRecorderPro_$stamp.pcm")
+                      recorder = audio
+                      tempFile = file
+                      audio.startRecording()
+                      recording = true
+
+                      worker = thread(name = "CallRecorderAudio") {
+                          try {
+                              FileOutputStream(file).use { output ->
+                                  val buffer = ByteArray(maxOf(minimum, 4096))
+                                  while (recording) {
+                                      val count = audio.read(buffer, 0, buffer.size)
+                                      if (count > 0) output.write(buffer, 0, count)
+                                      else if (count < 0) break
+                                  }
+                              }
+                          } catch (_: Exception) {
+                              // Finalize any usable audio captured before an error.
+                          }
+                      }
+
+                      updateNotification(
+                          "Recording microphone audio. Speakerphone is recommended."
+                      )
+                  } catch (e: Exception) {
+                      recording = false
+                      updateNotification("Recording could not start: ${e.message}")
+                  }
+              }
+
+              private fun stopRecording() {
+                  if (!recording) return
+                  recording = false
+
+                  try { recorder?.stop() } catch (_: Exception) {}
+                  try { worker?.join(2000) } catch (_: InterruptedException) {}
+                  try { recorder?.release() } catch (_: Exception) {}
+
+                  recorder = null
+                  worker = null
+
+                  val file = tempFile
+                  tempFile = null
+
+                  if (file != null && file.exists() && file.length() > 0L) {
+                      try {
+                          saveWav(file)
+                          updateNotification("Saved to Music/CallRecorder")
+                      } catch (e: Exception) {
+                          updateNotification("Could not save audio: ${e.message}")
+                      } finally {
+                          file.delete()
+                      }
+                  } else {
+                      file?.delete()
+                      updateNotification("No audio captured. Check microphone access.")
+                  }
+              }
+
+              private fun saveWav(pcm: File) {
+                  val stamp = SimpleDateFormat(
+                      "yyyy-MM-dd_HH-mm-ss", Locale.US
+                  ).format(Date())
+
+                  val values = ContentValues().apply {
+                      put(MediaStore.Audio.Media.DISPLAY_NAME, "Call_$stamp.wav")
+                      put(MediaStore.Audio.Media.MIME_TYPE, "audio/wav")
+                      if (Build.VERSION.SDK_INT >= 29) {
+                          put(MediaStore.Audio.Media.RELATIVE_PATH, "Music/CallRecorder/")
+                          put(MediaStore.Audio.Media.IS_PENDING, 1)
+                      }
+                  }
+
+                  val uri = contentResolver.insert(
+                      MediaStore.Audio.Media.EXTERNAL_CONTENT_URI, values
+                  ) ?: throw IllegalStateException("Could not create audio file")
+
+                  try {
+                      contentResolver.openOutputStream(uri)?.use { output ->
+                          val dataSize = pcm.length().coerceAtMost(
+                              Int.MAX_VALUE.toLong() - 44
+                          ).toInt()
+                          output.write(wavHeader(dataSize))
+                          FileInputStream(pcm).use { input -> input.copyTo(output) }
+                      } ?: throw IllegalStateException("Could not open audio output")
+
+                      if (Build.VERSION.SDK_INT >= 29) {
+                          val done = ContentValues().apply {
+                              put(MediaStore.Audio.Media.IS_PENDING, 0)
+                          }
+                          contentResolver.update(uri, done, null, null)
+                      }
+                  } catch (e: Exception) {
+                      contentResolver.delete(uri, null, null)
+                      throw e
+                  }
+              }
+
+              private fun wavHeader(size: Int): ByteArray {
+                  val h = ByteArray(44)
+                  fun ascii(offset: Int, text: String) {
+                      text.toByteArray(Charsets.US_ASCII).copyInto(h, offset)
+                  }
+                  fun int32(offset: Int, value: Int) {
+                      for (i in 0..3) h[offset + i] =
+                          (value ushr (8 * i)).toByte()
+                  }
+                  fun int16(offset: Int, value: Int) {
+                      h[offset] = (value and 255).toByte()
+                      h[offset + 1] = ((value ushr 8) and 255).toByte()
+                  }
+
+                  ascii(0, "RIFF")
+                  int32(4, size + 36)
+                  ascii(8, "WAVE")
+                  ascii(12, "fmt ")
+                  int32(16, 16)
+                  int16(20, 1)
+                  int16(22, 1)
+                  int32(24, RATE)
+                  int32(28, RATE * 2)
+                  int16(32, 2)
+                  int16(34, 16)
+                  ascii(36, "data")
+                  int32(40, size)
+                  return h
+              }
+
+              private fun createChannel() {
                   if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                       val channel = NotificationChannel(
-                          CHANNEL_ID,
-                          "CallRecorderPro",
+                          CHANNEL,
+                          "CallRecorderPro monitoring",
                           NotificationManager.IMPORTANCE_LOW
                       )
                       getSystemService(NotificationManager::class.java)
@@ -562,465 +661,53 @@ jobs:
                   }
               }
 
-              private fun buildNotification(): Notification {
-                  val stopIntent = Intent(
-                      this,
-                      FloatingService::class.java
-                  ).setAction(ACTION_STOP)
+              private fun notification(message: String): Notification {
+                  val builder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                      Notification.Builder(this, CHANNEL)
+                  } else {
+                      @Suppress("DEPRECATION")
+                      Notification.Builder(this)
+                  }
 
-                  val pendingIntent = PendingIntent.getService(
-                      this,
-                      2,
-                      stopIntent,
-                      PendingIntent.FLAG_UPDATE_CURRENT or
-                          PendingIntent.FLAG_IMMUTABLE
-                  )
-
-                  return NotificationCompat.Builder(this, CHANNEL_ID)
+                  return builder
                       .setContentTitle("CallRecorderPro")
-                      .setContentText(
-                          if (recording) "Recording in progress"
-                          else "Recorder ready"
-                      )
+                      .setContentText(message)
                       .setSmallIcon(android.R.drawable.ic_btn_speak_now)
-                      .setOngoing(recording)
-                      .addAction(
-                          android.R.drawable.ic_media_pause,
-                          "Stop",
-                          pendingIntent
-                      )
+                      .setOngoing(true)
                       .build()
               }
 
-              private fun updateNotification() {
-                  getSystemService(NotificationManager::class.java)
-                      .notify(NOTIFICATION_ID, buildNotification())
-              }
-
-              private fun notifyStatus(message: String) {
-                  sendBroadcast(
-                      Intent(ACTION_STATUS)
-                          .setPackage(packageName)
-                          .putExtra(EXTRA_MESSAGE, message)
-                  )
-                  Toast.makeText(
-                      this,
-                      message,
-                      Toast.LENGTH_LONG
-                  ).show()
-              }
-
-              private fun showFloatingButton() {
-                  if (!Settings.canDrawOverlays(this)) return
-
+              private fun updateNotification(message: String) {
                   try {
-                      windowManager =
-                          getSystemService(WINDOW_SERVICE) as WindowManager
-
-                      val button = Button(this).apply {
-                          text = "REC"
-                          textSize = 13f
-                          setOnClickListener {
-                              if (recording) stopRecording()
-                              else startRecording()
-                          }
-                      }
-
-                      floatingButton = button
-
-                      val windowType =
-                          if (Build.VERSION.SDK_INT >= 26) {
-                              WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
-                          } else {
-                              @Suppress("DEPRECATION")
-                              WindowManager.LayoutParams.TYPE_PHONE
-                          }
-
-                      val params = WindowManager.LayoutParams(
-                          WindowManager.LayoutParams.WRAP_CONTENT,
-                          WindowManager.LayoutParams.WRAP_CONTENT,
-                          windowType,
-                          WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
-                          PixelFormat.TRANSLUCENT
+                      getSystemService(NotificationManager::class.java).notify(
+                          NOTIFICATION_ID, notification(message)
                       )
-
-                      params.gravity = Gravity.TOP or Gravity.END
-                      params.x = 20
-                      params.y = 220
-
-                      windowManager?.addView(button, params)
-                  } catch (e: Exception) {
-                      notifyStatus(
-                          "Floating button error: ${e.message ?: "Unknown error"}"
-                      )
-                  }
+                  } catch (_: Exception) {}
               }
 
-              private fun updateFloatingButton() {
-                  floatingButton?.text = if (recording) "STOP" else "REC"
-                  updateNotification()
-              }
-
-              private fun startRecording() {
-                  if (recording || worker?.isAlive == true) {
-                      notifyStatus("Recording is already running.")
-                      return
-                  }
-
-                  if (
-                      checkSelfPermission(android.Manifest.permission.RECORD_AUDIO) !=
-                      PackageManager.PERMISSION_GRANTED
-                  ) {
-                      notifyStatus("Microphone permission is required.")
-                      return
-                  }
-
-                  val minBuffer = AudioRecord.getMinBufferSize(
-                      SAMPLE_RATE,
-                      AudioFormat.CHANNEL_IN_MONO,
-                      AudioFormat.ENCODING_PCM_16BIT
-                  )
-
-                  if (minBuffer <= 0) {
-                      notifyStatus("Could not initialize audio recording.")
-                      return
-                  }
-
-                  var recorder: AudioRecord? = null
-
-                  try {
-                      recorder = AudioRecord(
-                          MediaRecorder.AudioSource.MIC,
-                          SAMPLE_RATE,
-                          AudioFormat.CHANNEL_IN_MONO,
-                          AudioFormat.ENCODING_PCM_16BIT,
-                          maxOf(minBuffer, 4096)
-                      )
-
-                      if (recorder.state != AudioRecord.STATE_INITIALIZED) {
-                          recorder.release()
-                          notifyStatus("Microphone initialization failed.")
-                          return
-                      }
-
-                      val file = File(
-                          cacheDir,
-                          "recording_${System.currentTimeMillis()}.wav"
-                      )
-
-                      RandomAccessFile(file, "rw").use {
-                          it.setLength(0)
-                          it.write(ByteArray(44))
-                      }
-
-                      recorder.startRecording()
-
-                      if (
-                          recorder.recordingState !=
-                          AudioRecord.RECORDSTATE_RECORDING
-                      ) {
-                          recorder.release()
-                          notifyStatus("Recording did not start.")
-                          return
-                      }
-
-                      audioRecord = recorder
-                      tempFile = file
-                      workerError = null
-                      recording = true
-                      updateFloatingButton()
-
-                      notifyStatus(
-                          "Recording started. Press STOP to save the WAV file."
-                      )
-
-                      val activeRecorder = recorder
-
-                      worker = Thread {
-                          try {
-                              RandomAccessFile(file, "rw").use { raf ->
-                                  raf.seek(44)
-                                  val buffer = ByteArray(4096)
-
-                                  while (recording) {
-                                      val bytesRead = activeRecorder.read(
-                                          buffer,
-                                          0,
-                                          buffer.size
-                                      )
-
-                                      if (bytesRead > 0) {
-                                          val evenBytes =
-                                              bytesRead - (bytesRead % 2)
-
-                                          if (evenBytes > 0) {
-                                              raf.write(
-                                                  buffer,
-                                                  0,
-                                                  evenBytes
-                                              )
-                                          }
-                                      } else if (bytesRead < 0 && recording) {
-                                          workerError =
-                                              "Microphone read failed: $bytesRead"
-                                          recording = false
-                                      }
-                                  }
-
-                                  val pcmSize =
-                                      (raf.length() - 44).coerceAtLeast(0)
-
-                                  writeWavHeader(raf, pcmSize)
-                              }
-                          } catch (e: Exception) {
-                              if (recording) {
-                                  workerError =
-                                      "Audio write failed: ${e.message ?: "Unknown error"}"
-                              }
-                              recording = false
-                          }
-                      }.apply {
-                          name = "CallRecorderAudioWorker"
-                          start()
-                      }
-                  } catch (e: Exception) {
-                      recording = false
-                      try {
-                          recorder?.release()
-                      } catch (_: Exception) {
-                      }
-                      audioRecord = null
-                      updateFloatingButton()
-                      notifyStatus(
-                          "Could not start recording: ${e.message ?: "Unknown error"}"
-                      )
-                  }
-              }
-
-              private fun stopRecording() {
-                  if (!recording && worker == null) {
-                      notifyStatus("No recording is running.")
-                      return
-                  }
-
-                  recording = false
-
-                  try {
-                      audioRecord?.stop()
-                  } catch (_: Exception) {
-                  }
-
-                  try {
-                      worker?.join(5000)
-                  } catch (_: InterruptedException) {
-                      Thread.currentThread().interrupt()
-                  }
-
-                  if (worker?.isAlive == true) {
-                      worker?.interrupt()
-                      cleanupRecorder()
-                      worker = null
-                      updateFloatingButton()
-                      notifyStatus(
-                          "Save failed: the audio worker did not stop in time."
-                      )
-                      return
-                  }
-
-                  cleanupRecorder()
-                  updateFloatingButton()
-
-                  val error = workerError
-                  val file = tempFile
-
-                  worker = null
-                  tempFile = null
-
-                  if (error != null) {
-                      file?.delete()
-                      notifyStatus("Save failed: $error")
-                      return
-                  }
-
-                  if (
-                      file == null ||
-                      !file.exists() ||
-                      file.length() <= 44
-                  ) {
-                      file?.delete()
-                      notifyStatus(
-                          "No audio data was recorded. Nothing was saved."
-                      )
-                      return
-                  }
-
-                  try {
-                      saveToPublicMusic(file)
-                      file.delete()
-                      notifyStatus(
-                          "Saved successfully to Music/CallRecorder."
-                      )
-                  } catch (e: Exception) {
-                      notifyStatus(
-                          "Save failed: ${e.message ?: "Storage error"}. " +
-                              "The temporary recording may remain in app storage."
-                      )
-                  }
-              }
-
-              private fun cleanupRecorder() {
-                  try {
-                      audioRecord?.release()
-                  } catch (_: Exception) {
-                  }
-                  audioRecord = null
-              }
-
-              private fun saveToPublicMusic(file: File) {
-                  val timestamp = SimpleDateFormat(
-                      "yyyyMMdd_HHmmss",
-                      Locale.US
-                  ).format(Date())
-
-                  val values = ContentValues().apply {
-                      put(
-                          MediaStore.Audio.Media.DISPLAY_NAME,
-                          "Recording_$timestamp.wav"
-                      )
-                      put(MediaStore.Audio.Media.MIME_TYPE, "audio/wav")
-                      put(
-                          MediaStore.Audio.Media.RELATIVE_PATH,
-                          Environment.DIRECTORY_MUSIC + "/CallRecorder/"
-                      )
-                      put(MediaStore.Audio.Media.IS_PENDING, 1)
-                  }
-
-                  val uri: Uri = contentResolver.insert(
-                      MediaStore.Audio.Media.EXTERNAL_CONTENT_URI,
-                      values
-                  ) ?: throw IllegalStateException(
-                      "Android could not create the output file."
-                  )
-
-                  try {
-                      val output = contentResolver.openOutputStream(uri, "w")
-                          ?: throw IllegalStateException(
-                              "Could not open the output file."
-                          )
-
-                      output.use { out ->
-                          file.inputStream().use { input ->
-                              input.copyTo(out)
-                          }
-                          out.flush()
-                      }
-
-                      val expectedSize = file.length()
-                      val actualSize =
-                          contentResolver.openFileDescriptor(uri, "r").use {
-                              it?.statSize ?: -1L
-                          }
-
-                      if (
-                          actualSize >= 0 &&
-                          actualSize != expectedSize
-                      ) {
-                          throw IllegalStateException(
-                              "Saved file size does not match."
-                          )
-                      }
-
-                      val completed = ContentValues().apply {
-                          put(MediaStore.Audio.Media.IS_PENDING, 0)
-                      }
-
-                      val updated = contentResolver.update(
-                          uri,
-                          completed,
-                          null,
-                          null
-                      )
-
-                      if (updated <= 0) {
-                          throw IllegalStateException(
-                              "Could not finalize the saved file."
-                          )
-                      }
-                  } catch (e: Exception) {
-                      try {
-                          contentResolver.delete(uri, null, null)
-                      } catch (_: Exception) {
-                      }
-                      throw e
-                  }
-              }
-
-              private fun writeWavHeader(
-                  file: RandomAccessFile,
-                  pcmSize: Long
-              ) {
-                  val dataSize =
-                      pcmSize.coerceAtMost(0x7FFFFFFFL).toInt()
-
-                  file.seek(0)
-                  file.writeBytes("RIFF")
-                  writeIntLE(file, 36 + dataSize)
-                  file.writeBytes("WAVE")
-                  file.writeBytes("fmt ")
-                  writeIntLE(file, 16)
-                  writeShortLE(file, 1)
-                  writeShortLE(file, 1)
-                  writeIntLE(file, SAMPLE_RATE)
-                  writeIntLE(file, SAMPLE_RATE * 2)
-                  writeShortLE(file, 2)
-                  writeShortLE(file, 16)
-                  file.writeBytes("data")
-                  writeIntLE(file, dataSize)
-              }
-
-              private fun writeIntLE(
-                  file: RandomAccessFile,
-                  value: Int
-              ) {
-                  file.write(value and 0xff)
-                  file.write((value shr 8) and 0xff)
-                  file.write((value shr 16) and 0xff)
-                  file.write((value shr 24) and 0xff)
-              }
-
-              private fun writeShortLE(
-                  file: RandomAccessFile,
-                  value: Int
-              ) {
-                  file.write(value and 0xff)
-                  file.write((value shr 8) and 0xff)
-              }
-
+              @Suppress("DEPRECATION")
               override fun onDestroy() {
-                  if (recording || worker != null) {
-                      stopRecording()
-                  }
-
+                  stopRecording()
                   try {
-                      floatingButton?.let {
-                          windowManager?.removeView(it)
-                      }
-                  } catch (_: Exception) {
-                  }
-
-                  floatingButton = null
-                  stopForeground(STOP_FOREGROUND_REMOVE)
+                      telephony?.listen(listener, PhoneStateListener.LISTEN_NONE)
+                  } catch (_: Exception) {}
+                  monitoring = false
                   super.onDestroy()
               }
+
+              override fun onBind(intent: Intent?): IBinder? = null
           }
           EOF
 
       - name: Build APK
-        run: gradle --no-daemon assembleDebug
+        run: |
+          gradle --version
+          gradle --no-daemon assembleDebug
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: CallRecorder-APK
+          name: CallRecorderPro-APK
           path: app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
+          retention-days: 14
