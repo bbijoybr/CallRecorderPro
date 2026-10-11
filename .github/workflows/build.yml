@@ -1,11 +1,14 @@
 
-
 name: Build CallRecorder APK
 
 on:
   workflow_dispatch:
   push:
-    branches: [main]
+    branches:
+      - main
+
+permissions:
+  contents: read
 
 jobs:
   build:
@@ -16,23 +19,27 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Set up Java
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: '17'
 
-      - name: Set up Android
-        uses: android-actions/setup-android@v3
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v4
+        with:
+          packages: ''
 
-      - name: Install Android SDK
-        run: sdkmanager "platforms;android-35" "build-tools;35.0.0"
+      - name: Install Android SDK packages
+        run: |
+          yes | sdkmanager --licenses
+          sdkmanager "platforms;android-35" "build-tools;35.0.0"
 
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.9'
 
-      - name: Create Android project
+      - name: Create project files
         shell: bash
         run: |
           mkdir -p app/src/main/java/com/example/callrecorder
@@ -68,9 +75,11 @@ jobs:
               id("com.android.application")
               id("org.jetbrains.kotlin.android")
           }
+
           android {
               namespace = "com.example.callrecorder"
               compileSdk = 35
+
               defaultConfig {
                   applicationId = "com.example.callrecorder"
                   minSdk = 30
@@ -87,7 +96,6 @@ jobs:
               <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW"/>
               <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
               <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE"/>
-              <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
 
               <application
                   android:theme="@android:style/Theme.Material.Light.NoActionBar"
@@ -114,14 +122,13 @@ jobs:
           cat > app/src/main/java/com/example/callrecorder/MainActivity.kt <<'EOF'
           package com.example.callrecorder
 
+          import android.Manifest
           import android.app.Activity
           import android.content.Intent
+          import android.content.pm.PackageManager
           import android.net.Uri
           import android.os.Bundle
           import android.provider.Settings
-          import android.Manifest
-          import android.content.pm.PackageManager
-          import android.graphics.Color
           import android.view.Gravity
           import android.widget.Button
           import android.widget.LinearLayout
@@ -134,22 +141,27 @@ jobs:
                   val layout = LinearLayout(this).apply {
                       orientation = LinearLayout.VERTICAL
                       gravity = Gravity.CENTER
-                      setPadding(32, 32, 32, 32)
+                      setPadding(28, 28, 28, 28)
                   }
 
                   val info = TextView(this).apply {
-                      text = "Call Recorder\\n\\n1. Allow microphone access.\\n2. Allow display over other apps.\\n3. Start the floating button.\\n4. Tap it to start or stop recording.\\n\\nOnly microphone audio is recorded; the other caller may not be captured."
+                      text = "Call Recorder\n\n" +
+                          "1. Allow microphone permission.\n" +
+                          "2. Allow display over other apps.\n" +
+                          "3. Return here and press Start.\n" +
+                          "4. Tap the floating button to record or stop.\n\n" +
+                          "This records microphone audio only. " +
+                          "The other caller may not be captured."
                       textSize = 17f
-                      setTextColor(Color.BLACK)
                   }
 
-                  val button = Button(this).apply {
-                      text = "Enable Floating Record Button"
+                  val start = Button(this).apply {
+                      text = "Start Floating Recorder"
                       setOnClickListener { enableRecorder() }
                   }
 
                   layout.addView(info)
-                  layout.addView(button)
+                  layout.addView(start)
                   setContentView(layout)
               }
 
@@ -163,11 +175,12 @@ jobs:
                   }
 
                   if (!Settings.canDrawOverlays(this)) {
-                      val intent = Intent(
-                          Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
-                          Uri.parse("package:$packageName")
+                      startActivity(
+                          Intent(
+                              Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                              Uri.parse("package:$packageName")
+                          )
                       )
-                      startActivity(intent)
                       return
                   }
 
@@ -196,16 +209,25 @@ jobs:
           cat > app/src/main/java/com/example/callrecorder/FloatingService.kt <<'EOF'
           package com.example.callrecorder
 
-          import android.app.*
-          import android.content.*
+          import android.app.Notification
+          import android.app.NotificationChannel
+          import android.app.NotificationManager
+          import android.app.Service
+          import android.content.Intent
           import android.content.pm.ServiceInfo
           import android.graphics.Color
           import android.graphics.PixelFormat
-          import android.media.*
+          import android.media.AudioFormat
+          import android.media.AudioRecord
+          import android.media.MediaRecorder
           import android.media.audiofx.AcousticEchoCanceler
           import android.media.audiofx.NoiseSuppressor
-          import android.os.*
-          import android.view.*
+          import android.os.Environment
+          import android.os.IBinder
+          import android.view.Gravity
+          import android.view.MotionEvent
+          import android.view.View
+          import android.view.WindowManager
           import android.widget.TextView
           import java.io.File
           import java.io.RandomAccessFile
@@ -213,58 +235,257 @@ jobs:
           import java.nio.ByteOrder
 
           class FloatingService : Service() {
-              private var windowManager: WindowManager? = null
-              private var floatingView: TextView? = null
-              private var recorder: AudioRecord? = null
-              private var recordingThread: Thread? = null
-              private var isRecording = false
-              private var audioFile: File? = null
-              private var noiseSuppressor: NoiseSuppressor? = null
-              private var echoCanceler: AcousticEchoCanceler? = null
+              private var wm: WindowManager? = null
+              private var button: TextView? = null
+              private var audio: AudioRecord? = null
+              private var worker: Thread? = null
+              @Volatile private var recording = false
+              private var file: File? = null
+              private var ns: NoiseSuppressor? = null
+              private var aec: AcousticEchoCanceler? = null
 
               override fun onCreate() {
                   super.onCreate()
-                  val channel = NotificationChannel(
-                      "recorder_channel",
-                      "Call Recorder",
-                      NotificationManager.IMPORTANCE_LOW
-                  )
-                  getSystemService(NotificationManager::class.java)
-                      .createNotificationChannel(channel)
 
-                  val notification = Notification.Builder(this, "recorder_channel")
-                      .setContentTitle("Call Recorder is ready")
-                      .setContentText("Tap the floating button to record or stop.")
+                  val manager =
+                      getSystemService(NotificationManager::class.java)
+                  manager.createNotificationChannel(
+                      NotificationChannel(
+                          "recorder",
+                          "Call Recorder",
+                          NotificationManager.IMPORTANCE_LOW
+                      )
+                  )
+
+                  val notification = Notification.Builder(this, "recorder")
+                      .setContentTitle("Call Recorder")
+                      .setContentText("Floating recorder is ready")
                       .setSmallIcon(android.R.drawable.ic_btn_speak_now)
                       .build()
 
                   startForeground(
-                      1, notification,
+                      1,
+                      notification,
                       ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
                   )
-                  showFloatingButton()
+                  showButton()
               }
 
-              private fun showFloatingButton() {
-                  windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
-                  val button = TextView(this).apply {
+              private fun showButton() {
+                  wm = getSystemService(WINDOW_SERVICE) as WindowManager
+
+                  val view = TextView(this).apply {
                       text = "● REC"
                       textSize = 16f
                       setTextColor(Color.WHITE)
-                      setBackgroundColor(Color.rgb(190, 35, 35))
+                      setBackgroundColor(Color.rgb(180, 30, 30))
                       gravity = Gravity.CENTER
                       setPadding(24, 18, 24, 18)
                       setOnClickListener {
-                          if (isRecording) stopRecording() else startRecording()
+                          if (recording) stopRecording() else startRecording()
                       }
-                      setOnTouchListener(object : View.OnTouchListener {
-                          var startX = 0
-                          var startY = 0
-                          var touchX = 0f
-                          var touchY = 0f
+                  }
 
-                          override fun onTouch(v: View, e: MotionEvent): Boolean {
-                              val params = v.layoutParams as WindowManager.LayoutParams
+                  val params = WindowManager.LayoutParams(
+                      WindowManager.LayoutParams.WRAP_CONTENT,
+                      WindowManager.LayoutParams.WRAP_CONTENT,
+                      WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+                      WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
+                      PixelFormat.TRANSLUCENT
+                  ).apply {
+                      gravity = Gravity.TOP or Gravity.END
+                      x = 20
+                      y = 250
+                  }
+
+                  view.setOnTouchListener(object : View.OnTouchListener {
+                      var downX = 0f
+                      var downY = 0f
+                      var startX = 0
+                      var startY = 0
+                      var moved = false
+
+                      override fun onTouch(v: View, e: MotionEvent): Boolean {
+                          val p = v.layoutParams as WindowManager.LayoutParams
+                          when (e.action) {
+                              MotionEvent.ACTION_DOWN -> {
+                                  downX = e.rawX
+                                  downY = e.rawY
+                                  startX = p.x
+                                  startY = p.y
+                                  moved = false
+                                  return false
+                              }
+                              MotionEvent.ACTION_MOVE -> {
+                                  val dx = (e.rawX - downX).toInt()
+                                  val dy = (e.rawY - downY).toInt()
+                                  if (kotlin.math.abs(dx) > 8 ||
+                                      kotlin.math.abs(dy) > 8) moved = true
+                                  if (moved) {
+                                      p.x = (startX + dx).coerceAtLeast(0)
+                                      p.y = (startY + dy).coerceAtLeast(0)
+                                      wm?.updateViewLayout(v, p)
+                                      return true
+                                  }
+                              }
+                              MotionEvent.ACTION_UP -> if (moved) return true
+                          }
+                          return false
+                      }
+                  })
+
+                  button = view
+                  wm?.addView(view, params)
+              }
+
+              private fun startRecording() {
+                  if (recording) return
+
+                  try {
+                      val rate = 16000
+                      val min = AudioRecord.getMinBufferSize(
+                          rate,
+                          AudioFormat.CHANNEL_IN_MONO,
+                          AudioFormat.ENCODING_PCM_16BIT
+                      )
+                      if (min <= 0) return
+
+                      val rec = AudioRecord(
+                          MediaRecorder.AudioSource.MIC,
+                          rate,
+                          AudioFormat.CHANNEL_IN_MONO,
+                          AudioFormat.ENCODING_PCM_16BIT,
+                          min * 2
+                      )
+                      if (rec.state != AudioRecord.STATE_INITIALIZED) {
+                          rec.release()
+                          return
+                      }
+
+                      audio = rec
+                      if (NoiseSuppressor.isAvailable()) {
+                          ns = NoiseSuppressor.create(rec.audioSessionId)
+                          ns?.enabled = true
+                      }
+                      if (AcousticEchoCanceler.isAvailable()) {
+                          aec = AcousticEchoCanceler.create(rec.audioSessionId)
+                          aec?.enabled = true
+                      }
+
+                      val dir = File(
+                          getExternalFilesDir(Environment.DIRECTORY_MUSIC),
+                          "CallRecorder"
+                      )
+                      dir.mkdirs()
+                      file = File(
+                          dir,
+                          "Recording_${System.currentTimeMillis()}.wav"
+                      )
+
+                      recording = true
+                      button?.text = "■ STOP"
+                      rec.startRecording()
+
+                      worker = Thread {
+                          val output = file ?: return@Thread
+                          output.outputStream().use { stream ->
+                              stream.write(ByteArray(44))
+                              val buffer = ByteArray(min)
+                              while (recording) {
+                                  val n = rec.read(
+                                      buffer, 0, buffer.size,
+                                      AudioRecord.READ_BLOCKING
+                                  )
+                                  if (n > 0) stream.write(buffer, 0, n)
+                              }
+                          }
+                      }
+                      worker?.start()
+                  } catch (_: Exception) {
+                      recording = false
+                      button?.text = "● REC"
+                      try { audio?.release() } catch (_: Exception) {}
+                      audio = null
+                  }
+              }
+
+              private fun stopRecording() {
+                  if (!recording) return
+                  recording = false
+                  try { audio?.stop() } catch (_: Exception) {}
+                  try { worker?.join(3000) } catch (_: Exception) {}
+                  try { audio?.release() } catch (_: Exception) {}
+                  audio = null
+                  try { ns?.release() } catch (_: Exception) {}
+                  ns = null
+                  try { aec?.release() } catch (_: Exception) {}
+                  aec = null
+
+                  file?.let { f ->
+                      try {
+                          val size = (f.length() - 44).toInt().coerceAtLeast(0)
+                          RandomAccessFile(f, "rw").use { r ->
+                              r.seek(0)
+                              r.writeBytes("RIFF")
+                              putInt(r, size + 36)
+                              r.writeBytes("WAVEfmt ")
+                              putInt(r, 16)
+                              putShort(r, 1)
+                              putShort(r, 1)
+                              putInt(r, 16000)
+                              putInt(r, 32000)
+                              putShort(r, 2)
+                              putShort(r, 16)
+                              r.writeBytes("data")
+                              putInt(r, size)
+                          }
+                      } catch (_: Exception) {}
+                  }
+
+                  button?.text = "● REC"
+              }
+
+              private fun putInt(r: RandomAccessFile, n: Int) {
+                  r.write(
+                      ByteBuffer.allocate(4)
+                          .order(ByteOrder.LITTLE_ENDIAN)
+                          .putInt(n).array()
+                  )
+              }
+
+              private fun putShort(r: RandomAccessFile, n: Int) {
+                  r.write(
+                      ByteBuffer.allocate(2)
+                          .order(ByteOrder.LITTLE_ENDIAN)
+                          .putShort(n.toShort()).array()
+                  )
+              }
+
+              override fun onStartCommand(
+                  intent: Intent?, flags: Int, startId: Int
+              ): Int = START_NOT_STICKY
+
+              override fun onDestroy() {
+                  if (recording) stopRecording()
+                  try { button?.let { wm?.removeView(it) } }
+                  catch (_: Exception) {}
+                  super.onDestroy()
+              }
+
+              override fun onBind(intent: Intent?): IBinder? = null
+          }
+          EOF
+
+      - name: Build APK
+        run: gradle --no-daemon assembleDebug
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: CallRecorder-APK
+          path: app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+rams
                               when (e.action) {
                                   MotionEvent.ACTION_DOWN -> {
                                       startX = params.x
